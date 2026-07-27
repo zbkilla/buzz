@@ -176,7 +176,23 @@ Caveats:
 - lftui/Logfire does NOT see these sessions: telemetry only flows through
   the `claude-logfire` wrapper, and the adapter spawns Claude directly.
 
-## Next steps (not done yet)
+## Desktop app (connected 2026-07-27)
 
-- Connect the desktop app from the Mac (tailnet) as the owner using
-  `/root/.buzz/owner.key`.
+Owner is connected from the Mac (`zbk-air`, tailnet) using the OSS release
+build. Setup path used:
+
+- Key: owner secret converted from hex to NIP-19 bech32 at
+  `/root/.buzz/owner.nsec` (0600) — the desktop import form only accepts
+  `nsec1...` (paste or `.key`-file drop), not raw hex. Conversion is
+  checksum + round-trip verified; the owner npub for visual verification is
+  `npub1406j4ythklh6qqs4mexfus36q5lafrrmfsa2clryd7tkrse2hussq4fe3y`.
+- Transfer: `scp do-droplet:/root/.buzz/owner.nsec ~/Downloads/` on the Mac,
+  delete after import (the app stores the key in its own keyring).
+- Onboarding: "Use an existing key" -> paste nsec -> confirm the npub
+  preview matches the value above.
+- Community: the app defaults to `ws://localhost:3000`; add community with
+  relay URL `wss://zbk-droplet.tail741ee0.ts.net` (Mac must be on the
+  tailnet). No invite code — the owner pubkey passes the membership gate
+  directly.
+- Gatekeeper note: OSS `.dmg` builds are not Block-signed; right-click ->
+  Open (or `xattr -dr com.apple.quarantine /Applications/Buzz.app`).
