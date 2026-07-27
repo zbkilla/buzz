@@ -149,6 +149,35 @@ curl -sS -m 3 http://134.209.37.34:3000/_liveness                          # mus
 - E2E verified: owner sent `@claude ...` in the open `agents` channel
   (id in `/root/.buzz/agents-channel.id`); agent posted a threaded reply.
 
+## sol agent — GPT-5.6 Sol via cursor-agent (added 2026-07-27, verified E2E)
+
+Second harness agent, non-Claude engine, same buzz-acp pattern:
+
+- Identity: pubkey `b5e60efd18218a2aa80e42b559d6ebe2be5d4fa297b76ebc547c4510abd4cdd4`,
+  profile name `sol`, community role `member`, `agents` channel role `bot`.
+  Secret: `/root/.buzz/agent-sol.key` (0600).
+- ACP adapter: `cursor-acp` v0.1.0 (npm, community-maintained, source-audited
+  before install: no lifecycle scripts, no network of its own; deps = official
+  ACP SDK + uuid). It spawns `cursor-agent --print --output-format stream-json`
+  and maps the event stream to ACP.
+- Model pinning: the adapter does not wire `--model` in v1. Wrapper at
+  `/root/.buzz/bin/cursor-agent-sol` injects
+  `--model gpt-5.6-sol-high --force --trust` via the adapter's
+  `CURSOR_AGENT_EXECUTABLE` env hook.
+- Service: `buzz-acp-sol.service`, env `/root/.buzz/acp-sol.env` (0600),
+  log `/root/.buzz/acp-sol.log`. Same env shape as the claude agent plus
+  `CURSOR_AGENT_EXECUTABLE`; `respond_to=owner-only`.
+- Gotcha: `BUZZ_RELAY_URL` for the harness must be `wss://` — an `https://`
+  value fails at WS connect with "URL scheme not supported" (the buzz CLI
+  accepts both; the harness's WS client does not).
+- Same SECURITY posture as the claude agent: cursor-agent runs with
+  `--force --trust` as root; the `owner-only` author gate is the control.
+  The two agents cannot trigger each other (both gates are owner-only).
+- E2E verified: owner `@sol` mention in `agents` -> reply from the sol pubkey.
+- Observability: `tail -f /root/.buzz/acp-sol.log` (mentions, turn lifecycle);
+  cursor-agent sessions are NOT in the Claude session store — inspect via
+  `cursor-agent --resume` if needed.
+
 ### Observing the agent from the terminal
 
 `claude-agent-acp` drives a real Claude Code instance, so the agent's
