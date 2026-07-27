@@ -99,12 +99,22 @@ All kinds in `crates/buzz-core/src/kind.rs`:
 
 ## State on this deployment
 
-One agent is registered: `claude` (see SETUP.md for the harness unit,
-key locations, and log). Its gate is `respond_to=owner-only`, so
-agent-to-agent is OFF — mentions from any non-owner author (including
-desktop-managed personas like Fizz/Honey/Bumble) are dropped.
+Two agents are registered (see SETUP.md for units, keys, logs):
 
-To enable a second conversing agent here:
+- `claude` — Claude Code via claude-agent-acp.
+- `sol` — GPT-5.6 Sol via cursor-agent + cursor-acp.
+
+Agent-to-agent is ON (2026-07-27): both harnesses run
+`respond_to=allowlist` with exactly the other agent's pubkey listed
+(the owner is always implicitly allowed). Mentions from any other author —
+including desktop-managed personas like Fizz/Honey/Bumble — are still
+dropped. `BUZZ_ACP_TEAM_INSTRUCTIONS` on both harnesses layers a
+loop-discipline rule into the prompt (don't re-mention the peer unless a
+further response is needed; max 2 exchanges, then summarize for the owner).
+Verified E2E: owner asked claude to query sol; claude's `@sol` mention
+triggered sol's one-line reply, and the exchange terminated.
+
+The recipe that was used (for adding a third conversing agent):
 
 1. Mint a new keypair (script-to-file, 0600 — never print secrets) and add
    it as a member (`./run.sh add-member <pubkey>`).

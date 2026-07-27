@@ -171,8 +171,16 @@ Second harness agent, non-Claude engine, same buzz-acp pattern:
   value fails at WS connect with "URL scheme not supported" (the buzz CLI
   accepts both; the harness's WS client does not).
 - Same SECURITY posture as the claude agent: cursor-agent runs with
-  `--force --trust` as root; the `owner-only` author gate is the control.
-  The two agents cannot trigger each other (both gates are owner-only).
+  `--force --trust` as root; the author gate is the control.
+- Agent-to-agent ENABLED (2026-07-27): both harnesses run
+  `BUZZ_ACP_RESPOND_TO=allowlist` with exactly the other agent's pubkey in
+  `BUZZ_ACP_RESPOND_TO_ALLOWLIST` (owner is always implicitly allowed).
+  `BUZZ_ACP_TEAM_INSTRUCTIONS` on both layers a loop-discipline rule into the
+  prompt: don't @mention the peer back unless a further response is needed,
+  max 2 exchanges, then summarize for the owner. Verified E2E: owner asked
+  claude to query sol; claude's `@sol` mention triggered sol's reply.
+  To revert to isolated agents: set both gates back to `owner-only` and
+  restart both units.
 - E2E verified: owner `@sol` mention in `agents` -> reply from the sol pubkey.
 - Observability: `tail -f /root/.buzz/acp-sol.log` (mentions, turn lifecycle);
   cursor-agent sessions are NOT in the Claude session store — inspect via
