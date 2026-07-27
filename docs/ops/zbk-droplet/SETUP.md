@@ -66,6 +66,8 @@ Non-default `.env` choices:
 | `BUZZ_DOMAIN` / `RELAY_URL` / media / CORS | `zbk-droplet.tail741ee0.ts.net` (`wss://` / `https://`) | Matches the tailscale serve front, so client-visible URLs are correct with no restart later. |
 | `BUZZ_AUTO_MIGRATE` | `true` | Fresh DB; image embeds SQLx migrations. |
 
+> **Update 2026-07-27:** `BUZZ_CORS_ORIGINS` now also carries the desktop app's webview origins — appended as `,tauri://localhost,http://tauri.localhost` (`.env` backup: `.env.bak-20260727-030348`). The desktop client fetches `/api/join-policy` from origin `tauri://localhost` before connecting; without it in the allowlist WebKit kills the response and onboarding stalls on "Load failed". Incident write-up: `MAC_CLIENT.md`.
+
 ## Start and verify
 
 ```bash
@@ -99,6 +101,7 @@ curl -sS -m 3 http://134.209.37.34:3000/_liveness                          # mus
   warnings from `buzz_relay::api::git::store` are the git object-store A3
   conformance probe racing itself. Look for
   `git object-store backend admitted: A3 conformance probe passed`.
+- **The A3 probe can also deadlock at boot (seen 2026-07-27).** One boot after an env-change recreate logged the probe start line and then nothing: the relay never bound `:3000` (tailnet front served 502), health went `starting` -> `unhealthy` with zero restarts, and the process sat parked with no syscalls and no MinIO connections. Probe code is identical between `v0.4.26` and `main@95fdf97`, so this is nondeterministic, not a regression. Fix: `docker restart buzz-prod-relay-1` (the next boot passed in under a second). Escape hatch if it recurs: `BUZZ_GIT_CONFORMANCE_PROBE=false` in `.env`. Full evidence chain: `MAC_CLIENT.md`.
 - **`generate-key` prints the secret to stdout.** Capture it in a script
   variable; a keypair echoed into a logged terminal is burned (one was, and
   was discarded).
@@ -196,3 +199,5 @@ build. Setup path used:
   directly.
 - Gatekeeper note: OSS `.dmg` builds are not Block-signed; right-click ->
   Open (or `xattr -dr com.apple.quarantine /Applications/Buzz.app`).
+
+The flow above is the intended path; the Mac-side runbook **as actually performed** — including the drag-and-drop import failure and clipboard workaround, the onboarding buttons that matter for a self-hosted relay, and the two relay-side incidents fixed mid-flight (CORS allowlist, A3 probe deadlock) — is in `MAC_CLIENT.md`.
