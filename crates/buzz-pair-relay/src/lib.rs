@@ -56,7 +56,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_util::sync::CancellationToken;
 
 /// Hard per-connection lifetime. `pub(crate)` for test access.
-pub(crate) const CONN_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const CONN_TIMEOUT: Duration = Duration::from_secs(600);
 
 const MAX_CONNS: u32 = 128;
 const CHANNEL_CAP: usize = 4;
