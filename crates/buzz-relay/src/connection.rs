@@ -24,7 +24,22 @@ use crate::state::{run_registered_community_connection, AppState};
 use buzz_pubsub::EventTopic;
 
 /// Maximum time a new socket may hold a connection slot without completing NIP-42 auth.
-const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Defaults to 5s; override with `BUZZ_NIP42_AUTH_TIMEOUT_SECS` (clamped to
+/// 1..=300). Browser NIP-07 signers that route each signature through an
+/// extension prompt (e.g. on iOS Safari) can need well over 5s to answer the
+/// AUTH challenge.
+fn auth_timeout() -> Duration {
+    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        std::env::var("BUZZ_NIP42_AUTH_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|s| (1..=300).contains(s))
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(5))
+    })
+}
 
 /// Shared mutable subscription map for a single WebSocket connection.
 pub(crate) type ConnectionSubscriptions = Arc<Mutex<HashMap<String, Vec<Filter>>>>;
@@ -229,7 +244,7 @@ async fn handle_active_connection(
     let auth_timeout_cancel = cancel.clone();
     let auth_timeout_task = tokio::spawn(async move {
         tokio::select! {
-            _ = tokio::time::sleep(AUTH_TIMEOUT) => {
+            _ = tokio::time::sleep(auth_timeout()) => {
                 let authenticated = matches!(
                     *auth_timeout_conn.auth_state.read().await,
                     AuthState::Authenticated(_)
@@ -237,7 +252,7 @@ async fn handle_active_connection(
                 if !authenticated {
                     warn!(
                         conn_id = %auth_timeout_conn.conn_id,
-                        timeout_secs = AUTH_TIMEOUT.as_secs(),
+                        timeout_secs = auth_timeout().as_secs(),
                         "NIP-42 auth timeout — closing connection"
                     );
                     metrics::counter!("buzz_ws_auth_timeouts_total").increment(1);
