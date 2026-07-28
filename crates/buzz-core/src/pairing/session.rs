@@ -537,8 +537,8 @@ impl PairingSession {
         self.processed_ids.contains(&event.id.to_bytes())
     }
 
-    /// Override the session timeout for testing.
-    fn set_timeout(&mut self, timeout: Duration) {
+    /// Override the default session timeout.
+    pub fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
     }
 }

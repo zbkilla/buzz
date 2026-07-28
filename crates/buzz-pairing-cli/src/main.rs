@@ -53,6 +53,13 @@ enum Cmd {
         /// nsec (bech32) of the key to transfer. If omitted, generates a test key.
         #[arg(long)]
         nsec: Option<String>,
+
+        /// Send a Buzz credentials JSON payload (`{relayUrl, pubkey, nsec}`,
+        /// PayloadType::Custom) as the desktop app does, instead of a bare
+        /// nsec. Value is the relay HTTP base URL the target should use after
+        /// import, e.g. `https://relay.example.com`.
+        #[arg(long, requires = "nsec")]
+        credentials_url: Option<String>,
     },
 
     /// Act as the target device (scans QR code, receives the secret).
@@ -96,6 +103,9 @@ enum CliError {
 
 #[tokio::main]
 async fn main() {
+    // wss:// relays need a process-level rustls CryptoProvider; none of this
+    // crate's deps installs one.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
     if let Err(e) = run(cli.command).await {
         eprintln!("error: {e}");
@@ -105,18 +115,43 @@ async fn main() {
 
 async fn run(cmd: Cmd) -> Result<(), CliError> {
     match cmd {
-        Cmd::Source { relay, nsec } => cmd_source(relay, nsec).await,
+        Cmd::Source {
+            relay,
+            nsec,
+            credentials_url,
+        } => cmd_source(relay, nsec, credentials_url).await,
         Cmd::Target { relay, show_secret } => cmd_target(relay, show_secret).await,
         Cmd::TestVectors => cmd_test_vectors(),
     }
 }
 
-async fn cmd_source(relay_url: String, nsec: Option<String>) -> Result<(), CliError> {
+async fn cmd_source(
+    relay_url: String,
+    nsec: Option<String>,
+    credentials_url: Option<String>,
+) -> Result<(), CliError> {
     // Resolve the payload to transfer.
-    let (payload_str, payload_type) = resolve_payload(nsec)?;
+    let (payload_str, payload_type) = match credentials_url {
+        Some(url) => {
+            let nsec_str =
+                nsec.ok_or_else(|| CliError::Other("--credentials-url requires --nsec".into()))?;
+            let sk =
+                SecretKey::parse(&nsec_str).map_err(|e| CliError::InvalidNsec(e.to_string()))?;
+            let pubkey_hex = Keys::new(sk).public_key().to_hex();
+            let json = serde_json::json!({
+                "relayUrl": url,
+                "pubkey": pubkey_hex,
+                "nsec": nsec_str,
+            });
+            (Zeroizing::new(json.to_string()), PayloadType::Custom)
+        }
+        None => resolve_payload(nsec)?,
+    };
 
-    // Create pairing session.
+    // Create pairing session. The default 120s timeout assumes a same-desk
+    // QR scan; leave room for a human relaying the URI between devices.
     let (mut session, qr) = PairingSession::new_source(relay_url.clone());
+    session.set_timeout(Duration::from_secs(600));
     let qr_uri = encode_qr(&qr);
 
     println!("QR URI (contains session secret — do not share beyond the target device):");
