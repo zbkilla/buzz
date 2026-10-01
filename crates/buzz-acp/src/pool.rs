@@ -313,6 +313,13 @@ pub struct OwnedAgent {
 /// rename, so the new name is a reliable capability gate.
 const CLAUDE_AGENT_ACP_NAME: &str = "@agentclientprotocol/claude-agent-acp";
 
+/// Name reported by Google's Antigravity ACP server in its `initialize`
+/// response. It advertises protocol version 2 but its `session/new` handler
+/// drops the `systemPrompt` field unread (verified against 1.1.1 and 1.2.1),
+/// so standing context must ride in the first user message as for a legacy
+/// agent.
+const ANTIGRAVITY_ACP_NAME: &str = "antigravity-acp";
+
 fn has_system_prompt_support(
     protocol_version: u32,
     agent_name: &str,
@@ -322,6 +329,8 @@ fn has_system_prompt_support(
         goose_system_prompt_supported == Some(true)
     } else if agent_name == BUZZ_PI_ACP_NAME || agent_name == CLAUDE_AGENT_ACP_NAME {
         true
+    } else if agent_name == ANTIGRAVITY_ACP_NAME {
+        false
     } else {
         protocol_version >= 2
     }
@@ -333,7 +342,7 @@ fn session_new_system_prompt<'a>(
     agent_name: &str,
     prompt: Option<&'a str>,
 ) -> Option<SystemPromptTransport<'a>> {
-    if is_goose {
+    if is_goose || agent_name == ANTIGRAVITY_ACP_NAME {
         None
     } else if agent_name == BUZZ_PI_ACP_NAME {
         prompt.map(SystemPromptTransport::PiMeta)
@@ -11764,6 +11773,51 @@ done"#
                 agent.acp.shutdown().await;
             }
         }
+    }
+
+    /// Antigravity advertises protocol v2 but discards `systemPrompt`, so it
+    /// must take the legacy path: no `systemPrompt` on `session/new`, and the
+    /// support gate every dispatch path consults reports false so standing
+    /// context is prepended to the user message.
+    #[tokio::test]
+    async fn antigravity_gets_standing_context_in_user_message_not_system_prompt() {
+        let acp = spawn_switch_acp("[]", r#""result":{"stopReason":"end_turn"}"#).await;
+        let mut agent = switching_agent(acp, "unused");
+        agent.desired_model = None;
+        agent.agent_name = ANTIGRAVITY_ACP_NAME.into();
+        assert_eq!(agent.protocol_version, 2);
+        let observer = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(observer.clone()), 0);
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.base_prompt = Some("Custom base instructions.".into());
+        let mut session = None;
+        run_isolated_prompt(
+            &mut agent,
+            &ctx,
+            "do the thing",
+            Duration::from_secs(10),
+            &mut session,
+        )
+        .await
+        .unwrap();
+        let write = |method: &str| {
+            observer
+                .snapshot()
+                .into_iter()
+                .find(|event| event.kind == "acp_write" && event.payload["method"] == method)
+                .unwrap()
+                .payload
+        };
+        assert!(write("session/new")["params"].get("systemPrompt").is_none());
+        let prompt: String = write("session/prompt")["params"]["prompt"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect();
+        assert!(prompt.contains(&crate::queue::base_section("Custom base instructions.")));
+        assert!(prompt.contains("do the thing"));
+        agent.acp.shutdown().await;
     }
 
     #[tokio::test]
