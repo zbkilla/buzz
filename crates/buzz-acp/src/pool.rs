@@ -1754,6 +1754,67 @@ async fn create_session_and_apply_model(
     Ok(resp.session_id)
 }
 
+/// Run a prepared task with the normal session setup and standing instructions.
+/// The execution owner bounds startup, memory loading, and the turn together.
+pub(crate) async fn run_isolated_prompt(
+    agent: &mut OwnedAgent,
+    ctx: &PromptContext,
+    prompt: &str,
+    max_duration: Duration,
+    active_session: &mut Option<String>,
+) -> Result<StopReason, AcpError> {
+    let core = if ctx.memory_enabled {
+        if let Some(owner) = &ctx.agent_owner_pubkey {
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                crate::engram_fetch::build_core_section(&ctx.rest_client, &ctx.agent_keys, owner),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                tracing::warn!("core fetch timed out — emitting no section");
+                None
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let session_id = create_session_and_apply_model(
+        agent,
+        ctx,
+        core.as_deref(),
+        NewSessionChannelContext {
+            huddle_instructions: None,
+            canvas: None,
+            name: None,
+            scope: None,
+            channel_type: None,
+        },
+    )
+    .await?;
+    *active_session = Some(session_id.clone());
+    let prompt = prepend_standing_for_legacy(
+        if agent.has_system_prompt_support() {
+            2
+        } else {
+            1
+        },
+        &crate::queue::StandingContext {
+            base_prompt: ctx.base_prompt.as_deref(),
+            system_prompt: ctx.system_prompt.as_deref(),
+            team_instructions: ctx.team_instructions.as_deref(),
+            agent_core: core.as_deref(),
+            ..Default::default()
+        },
+        prompt,
+    );
+    agent
+        .acp
+        .session_prompt_with_idle_timeout(&session_id, &prompt, ctx.idle_timeout, max_duration)
+        .await
+}
+
 fn mcp_servers_with_git_origin(
     servers: &[McpServer],
     channel_id: Option<Uuid>,
@@ -2338,9 +2399,10 @@ pub async fn run_prompt_task(
     // Collects event IDs up front. On drop (any exit path — normal, early
     // return, or panic), spawns best-effort cleanup of both 👀 and 💬.
     // See `ReactionGuard` docs for ordering guarantees and known edge cases.
+    // Edits react on their visible original message, not the auxiliary edit.
     let reaction_ids: Vec<String> = batch
         .as_ref()
-        .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
+        .map(|b| b.events.iter().map(|be| be.routing_event_id()).collect())
         .unwrap_or_default();
     let _reaction_guard = ReactionGuard::new(ctx.rest_client.clone(), reaction_ids.clone());
 
@@ -3996,7 +4058,8 @@ fn resolve_context_target(batch: &FlushBatch, is_dm: bool) -> ContextTarget {
     let Some(last_event) = batch.events.last() else {
         return ContextTarget::None;
     };
-    if let Some(root_id) = crate::queue::parse_thread_tags(&last_event.event).root_event_id {
+    // Routing tags, not raw tags: an edit's history is its original's thread.
+    if let Some(root_id) = last_event.routing_thread_tags().root_event_id {
         return ContextTarget::Thread(root_id.to_ascii_lowercase());
     }
     if is_dm {
@@ -5331,6 +5394,24 @@ pub(crate) async fn post_failure_notice(
     thread_tags: &ThreadTags,
     content: &str,
 ) {
+    let Some(event) = build_failure_notice_event(&rest.keys, channel_id, thread_tags, content)
+    else {
+        return;
+    };
+    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "failure notice failed: {e}"),
+        Err(_) => tracing::warn!(channel = %channel_id, "failure notice timed out"),
+    }
+}
+
+/// Build the signed failure-notice event published by [`post_failure_notice`].
+pub(crate) fn build_failure_notice_event(
+    keys: &nostr::Keys,
+    channel_id: Uuid,
+    thread_tags: &ThreadTags,
+    content: &str,
+) -> Option<nostr::Event> {
     let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
         let root_id = nostr::EventId::from_hex(root).ok()?;
         let parent_id = thread_tags
@@ -5355,20 +5436,15 @@ pub(crate) async fn post_failure_notice(
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(channel = %channel_id, "failure notice: build failed: {e}");
-            return;
+            return None;
         }
     };
-    let event = match builder.sign_with_keys(&rest.keys) {
-        Ok(e) => e,
+    match builder.sign_with_keys(keys) {
+        Ok(e) => Some(e),
         Err(e) => {
             tracing::warn!(channel = %channel_id, "failure notice: sign failed: {e}");
-            return;
+            None
         }
-    };
-    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "failure notice failed: {e}"),
-        Err(_) => tracing::warn!(channel = %channel_id, "failure notice timed out"),
     }
 }
 
@@ -6791,6 +6867,7 @@ mod tests {
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: std::time::Instant::now(),
@@ -7043,6 +7120,7 @@ done"#
                 channel_id,
                 scope: SessionScope::Conversation { channel_id },
                 events: vec![crate::queue::BatchEvent {
+                    edit: None,
                     event,
                     prompt_tag: "test".into(),
                     received_at: std::time::Instant::now(),
@@ -7242,6 +7320,7 @@ done"#
             channel_id,
             scope: scope.clone(),
             events: vec![crate::queue::BatchEvent {
+                edit: None,
                 event: root,
                 prompt_tag: "@mention".into(),
                 received_at: std::time::Instant::now(),
@@ -7253,6 +7332,7 @@ done"#
             channel_id,
             scope: scope.clone(),
             events: vec![crate::queue::BatchEvent {
+                edit: None,
                 event: trigger,
                 prompt_tag: "@mention".into(),
                 received_at: std::time::Instant::now(),
@@ -7343,11 +7423,13 @@ done"#
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
+                edit: None,
                 event: new_event.clone(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![crate::queue::BatchEvent {
+                edit: None,
                 event: carry_over.clone(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
@@ -7358,6 +7440,7 @@ done"#
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
+                edit: None,
                 event: next_event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
@@ -7514,6 +7597,7 @@ done"#
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
+                edit: None,
                 event: trigger,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
@@ -7796,6 +7880,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 root_event_id: root_id,
             },
             events: vec![crate::queue::BatchEvent {
+                edit: None,
                 event: trigger,
                 prompt_tag: "@mention".into(),
                 received_at: std::time::Instant::now(),
@@ -7849,6 +7934,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
+                edit: None,
                 event: trigger,
                 prompt_tag: "@mention".into(),
                 received_at: std::time::Instant::now(),
@@ -8089,6 +8175,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             channel_id: scope.channel_id(),
             scope,
             events: vec![crate::queue::BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
@@ -8171,6 +8258,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         ]);
         let mut batch = batch_with_scope(conv(channel), current);
         batch.cancelled_events.push(crate::queue::BatchEvent {
+            edit: None,
             event: cancelled,
             prompt_tag: "cancelled".into(),
             received_at: std::time::Instant::now(),
@@ -8853,6 +8941,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
@@ -10601,6 +10690,7 @@ done"#
             channel_id,
             scope: conv(channel_id),
             events: vec![crate::queue::BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
