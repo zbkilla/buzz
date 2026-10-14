@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:lucide_icons_flutter/lucide_icons.dart';
+import 'package:buzz/shared/theme/buzz_icons.dart';
 
 import '../../shared/identity_names/identity_names_provider.dart';
 import '../../shared/relay/relay.dart';
@@ -24,6 +25,7 @@ class PulsePage extends HookConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final active = useState(PulseTab.everyone);
+    final isIos = defaultTargetPlatform == TargetPlatform.iOS;
     final currentPubkey = ref.watch(myPubkeyProvider);
     final contactsAsync = currentPubkey == null
         ? const AsyncValue<List<ContactEntry>>.data([])
@@ -55,8 +57,11 @@ class PulsePage extends HookConsumerWidget {
         reactions.asData?.value ?? const <String, PulseReactionState>{};
 
     return FrostedScaffold(
+      // Reset the native collapse state together with the new timeline.
+      key: isIos ? ValueKey(active.value) : null,
+      nativePinnedBody: true,
       resizeToAvoidBottomInset: true,
-      appBar: const FrostedAppBar(title: Text('Pulse')),
+      appBar: const FrostedAppBar(nativeLargeTitle: true, title: Text('Pulse')),
       floatingActionButton: FloatingActionButton(
         heroTag: 'pulse-compose-fab',
         onPressed: () => Navigator.of(context).push(
@@ -64,7 +69,7 @@ class PulsePage extends HookConsumerWidget {
         ),
         tooltip: 'New note',
         shape: const CircleBorder(),
-        child: const Icon(LucideIcons.plus),
+        child: const Icon(BuzzIcons.plus),
       ),
       body: Column(
         children: [
@@ -76,27 +81,27 @@ class PulsePage extends HookConsumerWidget {
               FilterChipItem(
                 id: PulseTab.everyone,
                 label: 'Everyone',
-                icon: LucideIcons.radio,
+                icon: BuzzIcons.radio,
               ),
               FilterChipItem(
                 id: PulseTab.following,
                 label: 'Following',
-                icon: LucideIcons.users,
+                icon: BuzzIcons.users,
               ),
               FilterChipItem(
                 id: PulseTab.liked,
                 label: 'Liked',
-                icon: LucideIcons.heart,
+                icon: BuzzIcons.heart,
               ),
               FilterChipItem(
                 id: PulseTab.agents,
                 label: 'Agents',
-                icon: LucideIcons.bot,
+                icon: BuzzIcons.bot,
               ),
               FilterChipItem(
                 id: PulseTab.mine,
                 label: 'Mine',
-                icon: LucideIcons.user,
+                icon: BuzzIcons.user,
               ),
             ],
           ),
@@ -160,7 +165,7 @@ class _PulseBody extends ConsumerWidget {
       loading: () => const _TimelineSkeleton(),
       error: (_, _) => _MessageListShell(
         child: _EmptyState(
-          icon: LucideIcons.circleAlert,
+          icon: BuzzIcons.circleAlert,
           message: 'Could not load Pulse. Pull to try again.',
         ),
       ),
@@ -265,7 +270,7 @@ class _EmptyState extends StatelessWidget {
   final IconData icon;
   final String message;
 
-  const _EmptyState({this.icon = LucideIcons.radio, required this.message});
+  const _EmptyState({this.icon = BuzzIcons.radio, required this.message});
 
   @override
   Widget build(BuildContext context) {

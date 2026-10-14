@@ -28,18 +28,6 @@ class _SystemMessageRow extends HookConsumerWidget {
     final userCache = ref.watch(userCacheProvider);
     final sourceMessages = groupedMessages ?? [message];
     final groupedMembership = _membershipDisplayEvent(sourceMessages);
-    final messageStyleAction = switch (systemEvent.type) {
-      SystemEventType.channelCreated => 'created this channel',
-      SystemEventType.huddleStarted => 'started a huddle',
-      SystemEventType.huddleEnded => 'ended the huddle',
-      _ => null,
-    };
-    final messageStyleActor = messageStyleAction == null
-        ? null
-        : systemEvent.actorPubkey?.trim();
-    final usesMessageStyleLayout =
-        groupedMembership != null ||
-        (messageStyleActor != null && messageStyleActor.isNotEmpty);
 
     final identityNames = ref.watch(channelIdentityNamesProvider(channelId));
     String resolveLabel(String? pubkey) {
@@ -49,6 +37,67 @@ class _SystemMessageRow extends HookConsumerWidget {
       }
       return identityNames.labelFor(pubkey);
     }
+
+    final target = systemEvent.targetPubkey?.trim().toLowerCase();
+    final targetIsAgent =
+        ref.watch(agentMentionPubkeysProvider(channelId)).contains(target) ||
+        userCache[target]?.ownerPubkey != null;
+    final messageStyleAction = switch (systemEvent.type) {
+      SystemEventType.memberRemoved => <InlineSpan>[
+        const TextSpan(text: 'removed '),
+        if (target == null || target.isEmpty)
+          TextSpan(text: resolveLabel(target))
+        else
+          WidgetSpan(
+            alignment: PlaceholderAlignment.baseline,
+            baseline: TextBaseline.alphabetic,
+            child: Semantics(
+              container: true,
+              label: resolveLabel(target),
+              button: true,
+              child: GestureDetector(
+                onTap: () => showUserProfileSheet(
+                  context,
+                  target,
+                  names: channelIdentityNamesProvider(channelId),
+                ),
+                child: ExcludeSemantics(
+                  child: MessageMentionPill(
+                    label: resolveLabel(target),
+                    isAgent: targetIsAgent,
+                    textStyle: _systemActionTextStyle(context),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        const TextSpan(text: ' from the channel'),
+      ],
+      SystemEventType.topicChanged => [
+        TextSpan(
+          text: describeChannelTextFieldChange('topic', systemEvent.topic),
+        ),
+      ],
+      SystemEventType.purposeChanged => [
+        TextSpan(
+          text: describeChannelTextFieldChange('purpose', systemEvent.purpose),
+        ),
+      ],
+      SystemEventType.channelCreated => [
+        const TextSpan(text: 'created this channel'),
+      ],
+      SystemEventType.huddleStarted => [
+        const TextSpan(text: 'started a huddle'),
+      ],
+      SystemEventType.huddleEnded => [const TextSpan(text: 'ended the huddle')],
+      _ => null,
+    };
+    final messageStyleActor = messageStyleAction == null
+        ? null
+        : systemEvent.actorPubkey?.trim();
+    final usesMessageStyleLayout =
+        groupedMembership != null ||
+        (messageStyleActor != null && messageStyleActor.isNotEmpty);
 
     final reactions = groupedMessages == null
         ? message.reactions
@@ -79,14 +128,7 @@ class _SystemMessageRow extends HookConsumerWidget {
       }
     }
 
-    void openReactionPopover(Rect anchorRect) {
-      final spotlightRenderObject = spotlightKey.currentContext
-          ?.findRenderObject();
-      final spotlightRect =
-          spotlightRenderObject is RenderBox && spotlightRenderObject.hasSize
-          ? spotlightRenderObject.localToGlobal(Offset.zero) &
-                spotlightRenderObject.size
-          : anchorRect;
+    void openReactionPopover(MessageLongPressDetails details) {
       showMessageActions(
         context: context,
         ref: ref,
@@ -97,7 +139,8 @@ class _SystemMessageRow extends HookConsumerWidget {
         currentPubkey: currentPubkey,
         isMember: isMember,
         isArchived: isArchived,
-        anchorRect: spotlightRect,
+        anchorRect: details.anchorRect,
+        captureAnchorSnapshot: details.captureSnapshot,
         popoverSpotlightPadding: EdgeInsets.fromLTRB(
           Grid.xxs,
           Grid.xxs,
@@ -113,7 +156,8 @@ class _SystemMessageRow extends HookConsumerWidget {
       clipBehavior: Clip.antiAlias,
       child: MessageLongPressInkWell(
         key: ValueKey('system-message-row-${message.id}'),
-        onLongPress: openReactionPopover,
+        onLongPressDetails: openReactionPopover,
+        snapshotKey: spotlightKey,
         borderRadius: BorderRadius.circular(Radii.md),
         highlightColor: context.colors.primary.withValues(alpha: 0.1),
         child: Padding(
@@ -124,7 +168,7 @@ class _SystemMessageRow extends HookConsumerWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              KeyedSubtree(
+              RepaintBoundary(
                 key: spotlightKey,
                 child: groupedMembership != null
                     ? _MembershipSystemMessageContent(
@@ -143,7 +187,7 @@ class _SystemMessageRow extends HookConsumerWidget {
                         createdAt: message.createdAt,
                         resolveLabel: resolveLabel,
                         userCache: userCache,
-                        actionSpans: [TextSpan(text: messageStyleAction)],
+                        actionSpans: messageStyleAction,
                       )
                     : Row(
                         children: [
@@ -565,7 +609,7 @@ Widget _systemEventAvatar(
       shape: BoxShape.circle,
     ),
     child: Icon(
-      LucideIcons.arrowLeftRight,
+      BuzzIcons.arrowLeftRight,
       size: 12,
       color: context.colors.onSurfaceVariant,
     ),
