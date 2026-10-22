@@ -1,6 +1,7 @@
-# Fork-only: build the zbk-droplet relay image and the agy-patched harness
-# from pinned commits, as 3-day workflow artifacts the droplet downloads.
-# No registry push, no secrets. Plan: /root/PLANS/BUZZ_RELAY_UPGRADE_2026_10_14.md
+# Fork-only: build the zbk-droplet relay image, the fork harness and the
+# agy-patched harness from pinned commits, as 3-day workflow artifacts the
+# droplet downloads. No registry push, no secrets.
+# 2026-10-22: eMudhra remediation (rustls-webpki 0.103.16, webpki-roots 1.0.10).
 name: Fork image (zbk-droplet)
 
 on:
@@ -16,8 +17,8 @@ concurrency:
 
 env:
   # Exact trees. MERGE_SHA = the fork main candidate; AGY_SHA = agy fix on target.
-  MERGE_SHA: 6776e913b20cc8192e45ecf36b5ee9495b859380
-  AGY_SHA: f4e0bb9d8db299803c601d390befd8cf32387b4c
+  MERGE_SHA: ae508843678151795c616f09f0db9aa855f0d3ce
+  AGY_SHA: 76c8edfcd19928286cb9ff79c010c6f4468f7b98
 
 jobs:
   relay-image:
@@ -59,6 +60,32 @@ jobs:
             relay-image.provenance
           retention-days: 3
           compression-level: 0
+          if-no-files-found: error
+
+  main-sprig:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ env.MERGE_SHA }}
+          persist-credentials: false
+      - name: Confirm checkout
+        run: test "$(git rev-parse HEAD)" = "$MERGE_SHA"
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2.79.15
+        with:
+          tool: cross@0.2.5
+      - name: Build sprig (musl, same script as upstream sprig.yml)
+        run: |
+          set -euo pipefail
+          USE_CROSS=1 ARCHIVE_BASENAME=sprig-fork-x86_64-unknown-linux-musl \
+            ./scripts/build-sprig.sh "0.1.0+fork.${MERGE_SHA::8}" x86_64-unknown-linux-musl
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: main-sprig
+          path: dist/sprig-fork-x86_64-unknown-linux-musl.tar.gz*
+          retention-days: 3
           if-no-files-found: error
 
   agy-sprig:
