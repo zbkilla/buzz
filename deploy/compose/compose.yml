@@ -95,6 +95,9 @@ services:
       MINIO_ROOT_PASSWORD: ${BUZZ_S3_SECRET_KEY:?set BUZZ_S3_SECRET_KEY}
     volumes:
       - buzz-minio-data:/data
+      # Fork: no patched MinIO image exists, so trust the host's maintained CA
+      # bundle instead of the image's 2025 copy (eMudhra distrust, 2026-10-22).
+      - /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
       interval: 5s
