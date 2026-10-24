@@ -234,6 +234,23 @@ sleep 1"#,
         assert_eq!(answer["result"]["outcome"]["optionId"], "opt-allow");
     }
 
+    /// The respawn path takes its policy from the config, not the fail-closed
+    /// default: a permissive mode must still approve after a respawn.
+    #[tokio::test]
+    async fn respawned_bypass_agent_still_auto_approves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("answer.json");
+        let startup = startup_for(
+            PermissionMode::BypassPermissions,
+            fake_agent_script(true, ALLOW_AND_REJECT, &out),
+        );
+        let (client, _, _) = crate::spawn_and_init(&startup, 0)
+            .await
+            .expect("respawn path spawns and initializes");
+        let answer = prompt_and_read_answer(client, &out).await;
+        assert_eq!(answer["result"]["outcome"]["optionId"], "opt-allow");
+    }
+
     /// Refill, panic recovery and crash respawn all go through
     /// `spawn_and_init`; a replacement agent must keep the reject policy.
     #[tokio::test]
