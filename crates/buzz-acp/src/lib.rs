@@ -3281,7 +3281,7 @@ async fn run_harness(
                 }
                 slot.respawn_in_flight = true;
                 tracing::info!(agent = idx, "slot refill: spawning background respawn");
-                let startup = PoolStartup::from_config(&config, observer.clone());
+                let startup = PoolStartup::from_config(config, observer.clone());
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
                     let result = spawn_and_init(&startup, idx).await;
