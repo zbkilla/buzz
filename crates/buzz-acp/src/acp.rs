@@ -145,6 +145,60 @@ fn build_initialize_params() -> serde_json::Value {
 ///
 /// One `AcpClient` per agent process. Multiple sessions can be created on the
 /// same client via repeated calls to [`session_new`](AcpClient::session_new).
+/// How the harness answers `session/request_permission` from the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PermissionPolicy {
+    /// Approve each request once. The harness default for unattended agents.
+    #[default]
+    AutoApprove,
+    /// Reject each request. Used for the `dont-ask` and `plan` modes, so a
+    /// tool call the agent's own settings did not pre-approve is denied even
+    /// when the adapter does not implement those modes itself.
+    Reject,
+}
+
+/// The harness's answer to one `session/request_permission` request.
+#[derive(Debug, PartialEq, Eq)]
+enum PermissionDecision {
+    /// Select the option with this `optionId`.
+    Selected(String),
+    /// Answer with `outcome: "cancelled"`, which denies the call.
+    Cancelled,
+}
+
+/// Choose the answer to a permission request under `policy`.
+///
+/// Options are found by `kind`, never by a hardcoded `optionId`. Under
+/// [`PermissionPolicy::Reject`] no allow option is ever selected: a request
+/// without a reject option is answered `cancelled`.
+fn permission_decision(
+    options: &[serde_json::Value],
+    policy: PermissionPolicy,
+) -> Result<PermissionDecision, AcpError> {
+    let option_id = |kind: &str| -> Option<Result<String, AcpError>> {
+        options
+            .iter()
+            .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some(kind))
+            .map(|opt| {
+                opt["optionId"].as_str().map(str::to_owned).ok_or_else(|| {
+                    AcpError::Protocol(format!("{kind} option missing optionId"))
+                })
+            })
+    };
+    match policy {
+        PermissionPolicy::Reject => match option_id("reject_once").or_else(|| option_id("reject_always")) {
+            Some(id) => id.map(PermissionDecision::Selected),
+            None => Ok(PermissionDecision::Cancelled),
+        },
+        PermissionPolicy::AutoApprove => match option_id("allow_once").or_else(|| option_id("reject_once")) {
+            Some(id) => id.map(PermissionDecision::Selected),
+            None => Err(AcpError::Protocol(
+                "no suitable permission option found (neither allow_once nor reject_once)".into(),
+            )),
+        },
+    }
+}
+
 pub struct AcpClient {
     /// The agent child process (kept alive to prevent zombie).
     child: Child,
@@ -167,6 +221,8 @@ pub struct AcpClient {
     /// Guards against double-response if a timeout fires after the allow_once
     /// response was written but before `pending_permission_id` was cleared.
     permission_responded: bool,
+    /// How `session/request_permission` requests are answered.
+    permission_policy: PermissionPolicy,
     /// The JSON-RPC id of the most recently sent `session/prompt` request.
     /// Used by [`cancel_with_cleanup`] to drain the correct response.
     /// Set in [`session_prompt_with_idle_timeout`]; consumed in [`cancel_with_cleanup`].
@@ -622,6 +678,7 @@ impl AcpClient {
             next_id: 0,
             pending_permission_id: None,
             permission_responded: false,
+            permission_policy: PermissionPolicy::default(),
             last_prompt_id: None,
             current_hard_deadline: None,
             observer: None,
@@ -641,6 +698,11 @@ impl AcpClient {
     pub fn set_observer(&mut self, observer: Option<ObserverHandle>, agent_index: usize) {
         self.observer = observer;
         self.observer_agent_index = Some(agent_index);
+    }
+
+    /// Set how this client answers `session/request_permission` requests.
+    pub fn set_permission_policy(&mut self, policy: PermissionPolicy) {
+        self.permission_policy = policy;
     }
 
     /// Update metadata that will be attached to subsequent raw wire events.
@@ -1262,7 +1324,7 @@ impl AcpClient {
     ///
     /// While waiting, handles:
     /// - `session/update` notifications → logged via tracing
-    /// - `session/request_permission` requests → auto-approved with `allow_once`
+    /// - `session/request_permission` requests → answered per the client's [`PermissionPolicy`]
     /// - Any other messages → debug-logged and ignored; if they carry an `id`
     ///   (i.e. they are requests, not notifications), a JSON-RPC -32601 error is sent.
     ///
@@ -2002,12 +2064,12 @@ impl AcpClient {
         }
     }
 
-    /// Auto-approve a `session/request_permission` request from the agent.
+    /// Answer a `session/request_permission` request from the agent.
     ///
-    /// Finds the option with `kind == "allow_once"` and responds with its `optionId`.
-    /// If no `allow_once` option exists, falls back to `reject_once`.
-    ///
-    /// **Critical:** Never hardcode `optionId` — always find it dynamically by `kind`.
+    /// Under [`PermissionPolicy::AutoApprove`] the `allow_once` option is
+    /// selected (falling back to `reject_once`); under
+    /// [`PermissionPolicy::Reject`] the request is always denied. See
+    /// [`permission_decision`].
     ///
     /// The request `id` is stored as `serde_json::Value` to support both numeric
     /// and string IDs per JSON-RPC 2.0.
@@ -2033,38 +2095,22 @@ impl AcpClient {
             options.len()
         );
 
-        // Find allow_once by kind — NEVER hardcode optionId.
-        let allow_once = options
-            .iter()
-            .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("allow_once"));
-
-        let response = if let Some(opt) = allow_once {
-            let option_id = opt["optionId"]
-                .as_str()
-                .ok_or_else(|| AcpError::Protocol("allow_once option missing optionId".into()))?;
-            tracing::info!(
-                target: "acp::permission",
-                "auto-approving permission id={id} with allow_once optionId={option_id:?}"
-            );
-            permission_response_selected(&id, option_id)
-        } else {
-            // No allow_once — fall back to reject_once.
-            tracing::warn!(
-                target: "acp::permission",
-                "no allow_once option found in permission request id={id}, falling back to reject_once"
-            );
-            let reject = options
-                .iter()
-                .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("reject_once"));
-
-            if let Some(opt) = reject {
-                let option_id = opt["optionId"].as_str().unwrap_or("reject");
-                permission_response_selected(&id, option_id)
-            } else {
-                return Err(AcpError::Protocol(
-                    "no suitable permission option found (neither allow_once nor reject_once)"
-                        .into(),
-                ));
+        let response = match permission_decision(options, self.permission_policy)? {
+            PermissionDecision::Selected(option_id) => {
+                tracing::info!(
+                    target: "acp::permission",
+                    "answering permission id={id} with optionId={option_id:?} (policy {:?})",
+                    self.permission_policy
+                );
+                permission_response_selected(&id, &option_id)
+            }
+            PermissionDecision::Cancelled => {
+                tracing::info!(
+                    target: "acp::permission",
+                    "denying permission id={id} with outcome cancelled (policy {:?}, no reject option)",
+                    self.permission_policy
+                );
+                permission_response_cancelled(&id)
             }
         };
 
@@ -2609,6 +2655,76 @@ mod tests {
             .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("allow_once"));
 
         assert!(allow_once.is_none());
+    }
+
+    fn opts(json: &str) -> Vec<serde_json::Value> {
+        serde_json::from_str(json).expect("options json")
+    }
+
+    #[test]
+    fn reject_policy_selects_reject_once_by_kind() {
+        let options = opts(
+            r#"[{"optionId": "a-1", "name": "Allow", "kind": "allow_once"},
+                {"optionId": "a-2", "name": "Always", "kind": "allow_always"},
+                {"optionId": "r-2", "name": "Never", "kind": "reject_always"},
+                {"optionId": "r-1", "name": "Reject", "kind": "reject_once"}]"#,
+        );
+        assert_eq!(
+            permission_decision(&options, PermissionPolicy::Reject).unwrap(),
+            PermissionDecision::Selected("r-1".into())
+        );
+    }
+
+    #[test]
+    fn reject_policy_falls_back_to_reject_always() {
+        let options = opts(
+            r#"[{"optionId": "a-1", "name": "Allow", "kind": "allow_once"},
+                {"optionId": "r-2", "name": "Never", "kind": "reject_always"}]"#,
+        );
+        assert_eq!(
+            permission_decision(&options, PermissionPolicy::Reject).unwrap(),
+            PermissionDecision::Selected("r-2".into())
+        );
+    }
+
+    #[test]
+    fn reject_policy_never_selects_allow_when_no_reject_option() {
+        let options = opts(
+            r#"[{"optionId": "a-1", "name": "Allow", "kind": "allow_once"},
+                {"optionId": "a-2", "name": "Always", "kind": "allow_always"}]"#,
+        );
+        assert_eq!(
+            permission_decision(&options, PermissionPolicy::Reject).unwrap(),
+            PermissionDecision::Cancelled
+        );
+        assert_eq!(
+            permission_decision(&[], PermissionPolicy::Reject).unwrap(),
+            PermissionDecision::Cancelled
+        );
+    }
+
+    #[test]
+    fn auto_approve_policy_selects_allow_once_then_reject_once() {
+        let both = opts(
+            r#"[{"optionId": "r-1", "name": "Reject", "kind": "reject_once"},
+                {"optionId": "a-1", "name": "Allow", "kind": "allow_once"}]"#,
+        );
+        assert_eq!(
+            permission_decision(&both, PermissionPolicy::AutoApprove).unwrap(),
+            PermissionDecision::Selected("a-1".into())
+        );
+        let reject_only = opts(r#"[{"optionId": "r-1", "name": "Reject", "kind": "reject_once"}]"#);
+        assert_eq!(
+            permission_decision(&reject_only, PermissionPolicy::AutoApprove).unwrap(),
+            PermissionDecision::Selected("r-1".into())
+        );
+        assert!(permission_decision(&[], PermissionPolicy::AutoApprove).is_err());
+    }
+
+    #[test]
+    fn permission_decision_rejects_option_without_id() {
+        let options = opts(r#"[{"name": "Reject", "kind": "reject_once"}]"#);
+        assert!(permission_decision(&options, PermissionPolicy::Reject).is_err());
     }
 
     #[test]
