@@ -166,6 +166,19 @@ impl PermissionMode {
     pub fn is_default(&self) -> bool {
         matches!(self, Self::Default)
     }
+
+    /// How the harness answers the agent's permission requests in this mode.
+    ///
+    /// `dont-ask` and `plan` reject every request, so they hold even when the
+    /// adapter does not advertise the mode and the harness skips setting it.
+    pub fn permission_policy(&self) -> crate::acp::PermissionPolicy {
+        match self {
+            Self::DontAsk | Self::Plan => crate::acp::PermissionPolicy::Reject,
+            Self::Default | Self::Auto | Self::AcceptEdits | Self::BypassPermissions => {
+                crate::acp::PermissionPolicy::AutoApprove
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for PermissionMode {
@@ -2428,6 +2441,22 @@ channels = "ALL"
         assert!(!PermissionMode::AcceptEdits.is_default());
         assert!(!PermissionMode::DontAsk.is_default());
         assert!(!PermissionMode::Plan.is_default());
+    }
+
+    #[test]
+    fn test_permission_policy_rejects_only_for_dont_ask_and_plan() {
+        use crate::acp::PermissionPolicy;
+        for mode in [PermissionMode::DontAsk, PermissionMode::Plan] {
+            assert_eq!(mode.permission_policy(), PermissionPolicy::Reject, "{mode}");
+        }
+        for mode in [
+            PermissionMode::Default,
+            PermissionMode::Auto,
+            PermissionMode::AcceptEdits,
+            PermissionMode::BypassPermissions,
+        ] {
+            assert_eq!(mode.permission_policy(), PermissionPolicy::AutoApprove, "{mode}");
+        }
     }
 
     #[test]

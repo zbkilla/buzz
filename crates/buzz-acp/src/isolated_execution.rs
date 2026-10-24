@@ -1,5 +1,5 @@
 //! One fresh process/session for a local task, with bounded cleanup.
-use crate::{acp, pool, AcpClient, OwnedAgent, PoolStartup, PromptContext, SessionState};
+use crate::{acp, pool, OwnedAgent, PoolStartup, PromptContext, SessionState};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
@@ -21,14 +21,7 @@ pub(crate) async fn execute(
         return Outcome::Cancelled;
     }
     let deadline = tokio::time::Instant::now() + duration;
-    let mut acp = match AcpClient::spawn(
-        &startup.command,
-        &startup.args,
-        &startup.extra_env,
-        startup.has_generated_codex_config,
-    )
-    .await
-    {
+    let mut acp = match startup.spawn_agent().await {
         Ok(acp) => acp,
         Err(_) => return Outcome::Failed("agent_spawn_failed"),
     };

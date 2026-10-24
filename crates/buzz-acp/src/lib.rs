@@ -6053,13 +6053,7 @@ async fn initialize_agent_pool(
     // Attempt each spawn under a 60-second timeout; a partial pool is valid.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
-        let spawn_result = AcpClient::spawn(
-            &startup.command,
-            &startup.args,
-            &startup.extra_env,
-            startup.has_generated_codex_config,
-        )
-        .await;
+        let spawn_result = startup.spawn_agent().await;
         match spawn_result {
             Ok(mut acp) => {
                 acp.set_observer(startup.observer.clone(), i);
