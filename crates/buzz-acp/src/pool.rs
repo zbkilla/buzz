@@ -2265,10 +2265,6 @@ async fn apply_permission_mode(
     Ok(())
 }
 
-/// Modes in which the agent itself still asks before every tool call its
-/// settings do not pre-approve, so the harness's reject policy decides.
-const MODES_THAT_ASK: &[&str] = &["default", "dontAsk", "plan"];
-
 /// For a restrictive mode the agent does not advertise: refuse the session if
 /// `session/new` reports the agent already running a mode that skips
 /// permission requests (for example `bypassPermissions` or `acceptEdits`).
@@ -2280,7 +2276,7 @@ fn check_unadvertised_restrictive_mode(
         .pointer("/modes/currentModeId")
         .and_then(|v| v.as_str())
     {
-        Some(current) if !MODES_THAT_ASK.contains(&current) => {
+        Some(current) if !crate::acp::MODES_THAT_ASK.contains(&current) => {
             tracing::error!(
                 target: "pool::permission",
                 "agent runs mode {current:?} and does not offer {requested:?} — refusing session"
