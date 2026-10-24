@@ -2004,13 +2004,17 @@ impl AcpClient {
                     && !MODES_THAT_ASK.contains(&mode)
                 {
                     // A switch to a mode that skips permission requests would
-                    // bypass the reject policy: stop the agent instead.
+                    // bypass the reject policy: stop the agent's whole process
+                    // group (the CLI runs below the adapter), not just the child.
                     tracing::error!(
                         target: "acp::permission",
                         "agent switched to permission mode {mode:?} under the reject policy — stopping it"
                     );
-                    if let Err(e) = self.child.start_kill() {
-                        tracing::error!(target: "acp::permission", "failed to stop agent: {e}");
+                    let group_killed = self.child.id().is_some_and(kill_process_group);
+                    if !group_killed {
+                        if let Err(e) = self.child.start_kill() {
+                            tracing::error!(target: "acp::permission", "failed to stop agent: {e}");
+                        }
                     }
                 } else {
                     tracing::info!(target: "acp::update", "current_mode_update: {mode}");
@@ -2707,7 +2711,14 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn reject_policy_stops_an_agent_that_switches_to_a_permissive_mode() {
-        let mut client = spawn_script("sleep 30").await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("grandchild.pid");
+        // The adapter's own child (the CLI) must die too: start one and record it.
+        let mut client = spawn_script(&format!(
+            "sleep 30 & echo $! > '{}'; wait",
+            pidfile.display()
+        ))
+        .await;
         let _ = client.handle_session_update(&mode_update("plan"));
         assert!(
             !exits_within(&mut client, 1).await,
@@ -2715,6 +2726,16 @@ mod tests {
         );
         let _ = client.handle_session_update(&mode_update("bypassPermissions"));
         assert!(exits_within(&mut client, 5).await, "agent must be stopped");
+        let grandchild = std::fs::read_to_string(&pidfile).expect("pid recorded");
+        let proc_dir = std::path::PathBuf::from(format!("/proc/{}", grandchild.trim()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while proc_dir.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            !proc_dir.exists(),
+            "the agent's own child process must be stopped too"
+        );
     }
 
     #[cfg(unix)]
