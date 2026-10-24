@@ -146,14 +146,19 @@ fn build_initialize_params() -> serde_json::Value {
 /// One `AcpClient` per agent process. Multiple sessions can be created on the
 /// same client via repeated calls to [`session_new`](AcpClient::session_new).
 /// How the harness answers `session/request_permission` from the agent.
+///
+/// The default is [`Reject`](Self::Reject), so a client spawned without an
+/// explicit policy fails closed. Pool agents get theirs from the configured
+/// permission mode (see `PermissionMode::permission_policy`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PermissionPolicy {
-    /// Approve each request once. The harness default for unattended agents.
-    #[default]
+    /// Approve each request once: the unattended-agent behavior for every
+    /// mode except `dont-ask` and `plan`.
     AutoApprove,
     /// Reject each request. Used for the `dont-ask` and `plan` modes, so a
     /// tool call the agent's own settings did not pre-approve is denied even
     /// when the adapter does not implement those modes itself.
+    #[default]
     Reject,
 }
 
@@ -2661,6 +2666,40 @@ mod tests {
 
     fn opts(json: &str) -> Vec<serde_json::Value> {
         serde_json::from_str(json).expect("options json")
+    }
+
+    /// A client spawned without an explicit policy fails closed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_without_explicit_policy_rejects_permission_requests() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("answer.json");
+        let script = format!(
+            r#"read -r REQ
+            ID=$(printf '%s' "$REQ" | sed -E 's/.*"id":([0-9]+).*/\1/')
+            echo '{{"jsonrpc":"2.0","id":"perm-1","method":"session/request_permission","params":{{"sessionId":"s1","toolCall":{{"toolCallId":"t1"}},"options":[{{"optionId":"opt-allow","name":"Allow","kind":"allow_once"}},{{"optionId":"opt-reject","name":"Reject","kind":"reject_once"}}]}}}}'
+            read -r ANSWER
+            printf '%s\n' "$ANSWER" > '{}'
+            echo '{{"jsonrpc":"2.0","id":'"$ID"',"result":{{"stopReason":"end_turn"}}}}'
+            sleep 1"#,
+            out.display()
+        );
+        let mut client = spawn_script(&script).await;
+        let stop = client
+            .session_prompt_with_idle_timeout(
+                "s1",
+                "hello",
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            .expect("prompt completes");
+        assert_eq!(stop, StopReason::EndTurn);
+        client.shutdown().await;
+        let answer: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&out).expect("answer").trim())
+                .expect("answer is JSON");
+        assert_eq!(answer["result"]["outcome"]["optionId"], "opt-reject");
     }
 
     #[test]
