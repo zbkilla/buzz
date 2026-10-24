@@ -162,6 +162,10 @@ pub enum PermissionPolicy {
     Reject,
 }
 
+/// Modes in which the agent itself still asks before every tool call its
+/// settings do not pre-approve, so the harness's reject policy decides.
+pub(crate) const MODES_THAT_ASK: &[&str] = &["default", "dontAsk", "plan"];
+
 /// The harness's answer to one `session/request_permission` request.
 #[derive(Debug, PartialEq, Eq)]
 enum PermissionDecision {
@@ -1994,6 +1998,25 @@ impl AcpClient {
                 self.handle_standard_usage_update(msg);
                 false
             }
+            "current_mode_update" => {
+                let mode = update["currentModeId"].as_str().unwrap_or("");
+                if self.permission_policy == PermissionPolicy::Reject
+                    && !MODES_THAT_ASK.contains(&mode)
+                {
+                    // A switch to a mode that skips permission requests would
+                    // bypass the reject policy: stop the agent instead.
+                    tracing::error!(
+                        target: "acp::permission",
+                        "agent switched to permission mode {mode:?} under the reject policy — stopping it"
+                    );
+                    if let Err(e) = self.child.start_kill() {
+                        tracing::error!(target: "acp::permission", "failed to stop agent: {e}");
+                    }
+                } else {
+                    tracing::info!(target: "acp::update", "current_mode_update: {mode}");
+                }
+                false
+            }
             "keepalive" => false,
             other => {
                 tracing::debug!(target: "acp::update", "session/update: {other}");
@@ -2666,6 +2689,42 @@ mod tests {
 
     fn opts(json: &str) -> Vec<serde_json::Value> {
         serde_json::from_str(json).expect("options json")
+    }
+
+    fn mode_update(mode: &str) -> serde_json::Value {
+        serde_json::json!({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "s1",
+            "update": {"sessionUpdate": "current_mode_update", "currentModeId": mode}
+        }})
+    }
+
+    async fn exits_within(client: &mut AcpClient, secs: u64) -> bool {
+        tokio::time::timeout(std::time::Duration::from_secs(secs), client.child.wait())
+            .await
+            .is_ok()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reject_policy_stops_an_agent_that_switches_to_a_permissive_mode() {
+        let mut client = spawn_script("sleep 30").await;
+        let _ = client.handle_session_update(&mode_update("plan"));
+        assert!(
+            !exits_within(&mut client, 1).await,
+            "an asking mode is fine"
+        );
+        let _ = client.handle_session_update(&mode_update("bypassPermissions"));
+        assert!(exits_within(&mut client, 5).await, "agent must be stopped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_approve_policy_ignores_mode_switches() {
+        let mut client = spawn_script("sleep 30").await;
+        client.set_permission_policy(PermissionPolicy::AutoApprove);
+        let _ = client.handle_session_update(&mode_update("bypassPermissions"));
+        assert!(!exits_within(&mut client, 1).await);
+        client.shutdown().await;
     }
 
     /// A client spawned without an explicit policy fails closed.
