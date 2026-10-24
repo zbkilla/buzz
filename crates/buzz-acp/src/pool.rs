@@ -1843,6 +1843,7 @@ async fn create_session_and_apply_model(
         if agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str()) {
             apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
         } else if ctx.permission_mode.permission_policy() == PermissionPolicy::Reject {
+            check_unadvertised_restrictive_mode(&resp.raw, ctx.permission_mode.as_wire_str())?;
             tracing::info!(
                 target: "pool::permission",
                 "agent does not advertise {:?}; the harness rejects every permission request on session {}",
@@ -2262,6 +2263,34 @@ async fn apply_permission_mode(
         }
     }
     Ok(())
+}
+
+/// Modes in which the agent itself still asks before every tool call its
+/// settings do not pre-approve, so the harness's reject policy decides.
+const MODES_THAT_ASK: &[&str] = &["default", "dontAsk", "plan"];
+
+/// For a restrictive mode the agent does not advertise: refuse the session if
+/// `session/new` reports the agent already running a mode that skips
+/// permission requests (for example `bypassPermissions` or `acceptEdits`).
+fn check_unadvertised_restrictive_mode(
+    session_new_result: &serde_json::Value,
+    requested: &str,
+) -> Result<(), AcpError> {
+    match session_new_result
+        .pointer("/modes/currentModeId")
+        .and_then(|v| v.as_str())
+    {
+        Some(current) if !MODES_THAT_ASK.contains(&current) => {
+            tracing::error!(
+                target: "pool::permission",
+                "agent runs mode {current:?} and does not offer {requested:?} — refusing session"
+            );
+            Err(AcpError::Protocol(format!(
+                "agent runs permission mode {current:?}, which does not ask, and cannot be set to {requested:?}"
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The current value of the `mode` config option in a
@@ -5860,6 +5889,26 @@ sleep 1"#
         let result = apply_permission_mode(&mut acp, "s1", &PermissionMode::Auto).await;
         acp.shutdown().await;
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn unadvertised_restrictive_mode_refuses_a_mode_that_skips_permission_requests() {
+        for current in ["bypassPermissions", "acceptEdits", "auto"] {
+            let session_new =
+                json!({"modes": {"currentModeId": current, "availableModes": [{"id": current}]}});
+            assert!(
+                check_unadvertised_restrictive_mode(&session_new, "dontAsk").is_err(),
+                "{current}"
+            );
+        }
+        for current in ["default", "plan", "dontAsk"] {
+            let session_new = json!({"modes": {"currentModeId": current}});
+            assert!(
+                check_unadvertised_restrictive_mode(&session_new, "dontAsk").is_ok(),
+                "{current}"
+            );
+        }
+        assert!(check_unadvertised_restrictive_mode(&json!({}), "dontAsk").is_ok());
     }
 
     #[test]
