@@ -180,22 +180,24 @@ fn permission_decision(
             .iter()
             .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some(kind))
             .map(|opt| {
-                opt["optionId"].as_str().map(str::to_owned).ok_or_else(|| {
-                    AcpError::Protocol(format!("{kind} option missing optionId"))
-                })
+                opt["optionId"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| AcpError::Protocol(format!("{kind} option missing optionId")))
             })
     };
-    match policy {
-        PermissionPolicy::Reject => match option_id("reject_once").or_else(|| option_id("reject_always")) {
-            Some(id) => id.map(PermissionDecision::Selected),
-            None => Ok(PermissionDecision::Cancelled),
-        },
-        PermissionPolicy::AutoApprove => match option_id("allow_once").or_else(|| option_id("reject_once")) {
-            Some(id) => id.map(PermissionDecision::Selected),
-            None => Err(AcpError::Protocol(
-                "no suitable permission option found (neither allow_once nor reject_once)".into(),
-            )),
-        },
+    let chosen = match policy {
+        PermissionPolicy::Reject => option_id("reject_once").or_else(|| option_id("reject_always")),
+        PermissionPolicy::AutoApprove => {
+            option_id("allow_once").or_else(|| option_id("reject_once"))
+        }
+    };
+    match (chosen, policy) {
+        (Some(id), _) => id.map(PermissionDecision::Selected),
+        (None, PermissionPolicy::Reject) => Ok(PermissionDecision::Cancelled),
+        (None, PermissionPolicy::AutoApprove) => Err(AcpError::Protocol(
+            "no suitable permission option found (neither allow_once nor reject_once)".into(),
+        )),
     }
 }
 

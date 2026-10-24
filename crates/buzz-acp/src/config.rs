@@ -2485,7 +2485,11 @@ channels = "ALL"
             PermissionMode::AcceptEdits,
             PermissionMode::BypassPermissions,
         ] {
-            assert_eq!(mode.permission_policy(), PermissionPolicy::AutoApprove, "{mode}");
+            assert_eq!(
+                mode.permission_policy(),
+                PermissionPolicy::AutoApprove,
+                "{mode}"
+            );
         }
     }
 
