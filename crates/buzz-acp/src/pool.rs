@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::acp::{
     extract_model_config_options, extract_model_state, extract_thought_level_config_id,
     model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer,
-    ModelSwitchMethod, StopReason, SystemPromptTransport, BUZZ_PI_ACP_NAME,
+    ModelSwitchMethod, PermissionPolicy, StopReason, SystemPromptTransport, BUZZ_PI_ACP_NAME,
 };
 use crate::config::{compose_scoped_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -1835,12 +1835,21 @@ async fn create_session_and_apply_model(
     // Apply permission mode if not the agent's built-in default AND the agent
     // advertises the requested mode in session/new. Agents that don't support
     // the mode (e.g., goose crashes on unrecognized set_config_option values)
-    // are safely skipped — the harness then answers each request itself per
-    // the mode's PermissionPolicy (dont-ask and plan reject, others approve).
-    if !ctx.permission_mode.is_default()
-        && agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str())
-    {
-        apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
+    // are skipped — the harness then answers each request itself per the
+    // mode's PermissionPolicy (dont-ask and plan reject, others approve).
+    // Rejecting every request is what dont-ask means: the agent runs only what
+    // its own settings pre-approve.
+    if !ctx.permission_mode.is_default() {
+        if agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str()) {
+            apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
+        } else if ctx.permission_mode.permission_policy() == PermissionPolicy::Reject {
+            tracing::info!(
+                target: "pool::permission",
+                "agent does not advertise {:?}; the harness rejects every permission request on session {}",
+                ctx.permission_mode.as_wire_str(),
+                resp.session_id
+            );
+        }
     }
 
     Ok(resp.session_id)
@@ -2171,6 +2180,11 @@ fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) 
 /// each permission request per the mode's `PermissionPolicy` in
 /// `handle_permission_request`.
 ///
+/// **Restrictive modes fail closed:** for a mode whose policy is
+/// [`PermissionPolicy::Reject`] (`dont-ask`, `plan`), an agent-reported error
+/// or a response reporting a different current mode is returned as an error,
+/// so the session is not used.
+///
 /// **Fatal exception:** if the agent process exits (e.g., goose crashes on
 /// unrecognized methods), returns `Err(AgentExited)` so the caller can respawn.
 async fn apply_permission_mode(
@@ -2185,12 +2199,29 @@ async fn apply_permission_mode(
     })
     .await;
 
+    let restrictive = mode.permission_policy() == PermissionPolicy::Reject;
     match result {
-        Ok(Ok(_)) => {
-            tracing::info!(
-                target: "pool::permission",
-                "applied permission mode {wire:?} on session {session_id}"
-            );
+        Ok(Ok(response)) => {
+            if let Some(current) = reported_mode(&response).filter(|current| *current != wire) {
+                if restrictive {
+                    tracing::error!(
+                        target: "pool::permission",
+                        "agent reports mode {current:?} after setting {wire:?} — refusing session {session_id}"
+                    );
+                    return Err(AcpError::Protocol(format!(
+                        "agent kept permission mode {current:?} instead of {wire:?}"
+                    )));
+                }
+                tracing::warn!(
+                    target: "pool::permission",
+                    "agent reports mode {current:?} after setting {wire:?} on session {session_id}"
+                );
+            } else {
+                tracing::info!(
+                    target: "pool::permission",
+                    "applied permission mode {wire:?} on session {session_id}"
+                );
+            }
         }
         // Transport-class errors may have corrupted the stdio stream — propagate
         // so the caller can respawn the agent.
@@ -2202,6 +2233,15 @@ async fn apply_permission_mode(
             tracing::error!(
                 target: "pool::permission",
                 "fatal error setting permission mode {wire:?}: {e}"
+            );
+            return Err(e);
+        }
+        // Application-level errors in a restrictive mode: the agent may be
+        // running a more permissive mode than requested, so do not use it.
+        Ok(Err(e)) if restrictive => {
+            tracing::error!(
+                target: "pool::permission",
+                "failed to set restrictive permission mode {wire:?}: {e} — refusing session {session_id}"
             );
             return Err(e);
         }
@@ -2222,6 +2262,22 @@ async fn apply_permission_mode(
         }
     }
     Ok(())
+}
+
+/// The current value of the `mode` config option in a
+/// `session/set_config_option` response, if the agent reports one.
+fn reported_mode(response: &serde_json::Value) -> Option<&str> {
+    response["configOptions"]
+        .as_array()?
+        .iter()
+        .find(|opt| {
+            opt.get("configId")
+                .or_else(|| opt.get("id"))
+                .and_then(|v| v.as_str())
+                == Some("mode")
+        })?
+        .get("currentValue")?
+        .as_str()
 }
 
 /// Prepend a legacy agent's standing context to a user-message body.
@@ -5737,6 +5793,83 @@ pub(crate) mod tests {
             &session_new,
             PermissionMode::Auto.as_wire_str()
         ));
+    }
+
+    /// A fake agent that answers one `session/set_config_option` with `reply`
+    /// (the JSON after `"id":<id>,`).
+    async fn set_mode_agent(reply: &str) -> AcpClient {
+        let script = format!(
+            r#"read -r REQ
+ID=$(printf '%s' "$REQ" | sed -E 's/.*"id":([0-9]+).*/\1/')
+echo '{{"jsonrpc":"2.0","id":'"$ID"',{reply}}}'
+sleep 1"#
+        );
+        AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("spawn fake agent")
+    }
+
+    const MODE_ERROR: &str = r#""error":{"code":-32602,"message":"unsupported mode"}"#;
+
+    fn mode_reply(current: &str) -> String {
+        format!(r#""result":{{"configOptions":[{{"id":"mode","currentValue":"{current}"}}]}}"#)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restrictive_mode_refuses_session_when_agent_rejects_the_mode() {
+        let mut acp = set_mode_agent(MODE_ERROR).await;
+        let result = apply_permission_mode(&mut acp, "s1", &PermissionMode::DontAsk).await;
+        acp.shutdown().await;
+        assert!(
+            result.is_err(),
+            "dont-ask must not proceed after a rejected mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restrictive_mode_refuses_session_when_agent_keeps_another_mode() {
+        let mut acp = set_mode_agent(&mode_reply("default")).await;
+        let result = apply_permission_mode(&mut acp, "s1", &PermissionMode::Plan).await;
+        acp.shutdown().await;
+        assert!(
+            result.is_err(),
+            "plan must not proceed when the agent stays in default"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restrictive_mode_accepts_confirmed_or_unreported_mode() {
+        let mut acp = set_mode_agent(&mode_reply("dontAsk")).await;
+        let confirmed = apply_permission_mode(&mut acp, "s1", &PermissionMode::DontAsk).await;
+        acp.shutdown().await;
+        assert!(confirmed.is_ok(), "{confirmed:?}");
+
+        let mut acp = set_mode_agent(r#""result":{}"#).await;
+        let unreported = apply_permission_mode(&mut acp, "s1", &PermissionMode::DontAsk).await;
+        acp.shutdown().await;
+        assert!(unreported.is_ok(), "{unreported:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permissive_mode_still_tolerates_a_rejected_mode() {
+        let mut acp = set_mode_agent(MODE_ERROR).await;
+        let result = apply_permission_mode(&mut acp, "s1", &PermissionMode::Auto).await;
+        acp.shutdown().await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn reported_mode_reads_the_mode_option() {
+        let response = json!({"configOptions": [
+            {"id": "model", "currentValue": "x"},
+            {"configId": "mode", "currentValue": "plan"}
+        ]});
+        assert_eq!(reported_mode(&response), Some("plan"));
+        assert_eq!(reported_mode(&json!({})), None);
     }
 
     #[test]

@@ -3281,14 +3281,10 @@ async fn run_harness(
                 }
                 slot.respawn_in_flight = true;
                 tracing::info!(agent = idx, "slot refill: spawning background respawn");
-                let cmd = config.agent_command.clone();
-                let args = config.agent_args.clone();
-                let env = config.persona_env_vars.clone();
-                let has_codex = config.has_generated_codex_config;
-                let observer = observer.clone();
+                let startup = PoolStartup::from_config(&config, observer.clone());
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+                    let result = spawn_and_init(&startup, idx).await;
                     guard.send(result);
                 });
             }
@@ -5750,16 +5746,13 @@ fn recover_panicked_agent(
 
     // Spawn respawn work off the main loop.
     slot.respawn_in_flight = true;
-    let cmd = config.agent_command.clone();
-    let args = config.agent_args.clone();
-    let env = config.persona_env_vars.clone();
-    let has_codex = config.has_generated_codex_config;
+    let startup = PoolStartup::from_config(config, observer);
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result = spawn_and_init(&startup, i).await;
         guard.send(result);
     });
 }
@@ -5992,10 +5985,7 @@ fn spawn_respawn_task(
     slot.respawn_in_flight = true;
 
     // Spawn the actual work (shutdown + sleep + spawn + init) off the main loop.
-    let cmd = config.agent_command.clone();
-    let args = config.agent_args.clone();
-    let env = config.persona_env_vars.clone();
-    let has_codex = config.has_generated_codex_config;
+    let startup = PoolStartup::from_config(config, observer);
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -6007,7 +5997,7 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result = spawn_and_init(&startup, index).await;
         guard.send(result);
     });
 
@@ -6148,20 +6138,19 @@ async fn initialize_agent_pool(
 // ── spawn_and_init ────────────────────────────────────────────────────────────
 /// Spawn an agent subprocess and run the MCP `initialize` handshake.
 ///
-/// Takes owned args so it can run in a background `tokio::spawn` task without
-/// borrowing `Config`. All respawn/refill paths use this.
+/// Takes an owned [`PoolStartup`] snapshot so it can run in a background
+/// `tokio::spawn` task without borrowing `Config`. All respawn/refill paths
+/// use this, and it spawns through [`PoolStartup::spawn_agent`] so a
+/// replacement agent keeps the configured permission policy.
 async fn spawn_and_init(
-    command: &str,
-    args: &[String],
-    extra_env: &[(String, String)],
-    has_generated_codex_config: bool,
+    startup: &PoolStartup,
     agent_index: usize,
-    observer: Option<observer::ObserverHandle>,
 ) -> Result<(AcpClient, u32, String)> {
-    let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
+    let mut acp = startup
+        .spawn_agent()
         .await
         .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
-    acp.set_observer(observer, agent_index);
+    acp.set_observer(startup.observer.clone(), agent_index);
 
     match acp.initialize().await {
         Ok(init_result) => {

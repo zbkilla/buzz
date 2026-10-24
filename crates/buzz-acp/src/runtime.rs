@@ -61,7 +61,7 @@ pub(crate) struct PoolStartup {
 }
 
 impl PoolStartup {
-    fn from_config(config: &Config, observer: Option<observer::ObserverHandle>) -> Self {
+    pub(crate) fn from_config(config: &Config, observer: Option<observer::ObserverHandle>) -> Self {
         Self {
             agents: config.agents,
             command: config.agent_command.clone(),
@@ -145,14 +145,26 @@ mod tests {
     use super::*;
     use crate::config::PermissionMode;
 
-    /// A fake agent that answers one prompt, asking permission once with
-    /// `options` first, and records the harness's answer in `out`.
-    fn startup_for(mode: PermissionMode, options: &str, out: &std::path::Path) -> PoolStartup {
+    const ALLOW_AND_REJECT: &str = r#"[{"optionId":"opt-allow","name":"Allow","kind":"allow_once"},{"optionId":"opt-reject","name":"Reject","kind":"reject_once"}]"#;
+    const ALLOW_ONLY: &str = r#"[{"optionId":"opt-allow","name":"Allow","kind":"allow_once"}]"#;
+
+    /// Shell for a fake agent: optionally answers `initialize`, then answers one
+    /// prompt, asking permission once with `options` first, and records the
+    /// harness's answer in `out`.
+    fn fake_agent_script(answers_initialize: bool, options: &str, out: &std::path::Path) -> String {
         let request = format!(
             r#"{{"jsonrpc":"2.0","id":"perm-1","method":"session/request_permission","params":{{"sessionId":"s1","toolCall":{{"toolCallId":"t1"}},"options":{options}}}}}"#
         );
-        let script = format!(
-            r#"read -r REQ
+        let init = if answers_initialize {
+            r#"read -r INIT
+IID=$(printf '%s' "$INIT" | sed -E 's/.*"id":([0-9]+).*/\1/')
+echo '{"jsonrpc":"2.0","id":'"$IID"',"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+"#
+        } else {
+            ""
+        };
+        format!(
+            r#"{init}read -r REQ
 ID=$(printf '%s' "$REQ" | sed -E 's/.*"id":([0-9]+).*/\1/')
 printf '%s\n' '{request}'
 read -r ANSWER
@@ -160,27 +172,22 @@ printf '%s\n' "$ANSWER" > '{out}'
 echo '{{"jsonrpc":"2.0","id":'"$ID"',"result":{{"stopReason":"end_turn"}}}}'
 sleep 1"#,
             out = out.display()
-        );
-        PoolStartup {
-            agents: 1,
-            command: "bash".into(),
-            args: vec!["-c".into(), script],
-            extra_env: Vec::new(),
-            has_generated_codex_config: false,
-            model: None,
-            effort_level: None,
-            observer: None,
-            permission_policy: mode.permission_policy(),
-        }
+        )
     }
 
-    async fn harness_answer(mode: PermissionMode, options: &str) -> serde_json::Value {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let out = dir.path().join("answer.json");
-        let mut client = startup_for(mode, options, &out)
-            .spawn_agent()
-            .await
-            .expect("spawn fake agent");
+    /// The production startup snapshot for `mode`, pointed at a fake agent.
+    fn startup_for(mode: PermissionMode, script: String) -> PoolStartup {
+        let mut config = crate::build_mcp_servers_tests::test_config();
+        config.permission_mode = mode;
+        config.agent_command = "bash".into();
+        config.agent_args = vec!["-c".into(), script];
+        PoolStartup::from_config(&config, None)
+    }
+
+    async fn prompt_and_read_answer(
+        mut client: AcpClient,
+        out: &std::path::Path,
+    ) -> serde_json::Value {
         let stop = client
             .session_prompt_with_idle_timeout(
                 "s1",
@@ -192,16 +199,23 @@ sleep 1"#,
             .expect("prompt completes");
         assert_eq!(stop, acp::StopReason::EndTurn);
         client.shutdown().await;
-        let answer = std::fs::read_to_string(&out).expect("fake agent recorded the answer");
+        let answer = std::fs::read_to_string(out).expect("fake agent recorded the answer");
         serde_json::from_str(answer.trim()).expect("answer is JSON")
     }
 
-    const ALLOW_AND_REJECT: &str = r#"[{"optionId":"opt-allow","name":"Allow","kind":"allow_once"},{"optionId":"opt-reject","name":"Reject","kind":"reject_once"}]"#;
-    const ALLOW_ONLY: &str = r#"[{"optionId":"opt-allow","name":"Allow","kind":"allow_once"}]"#;
+    async fn pool_agent_answer(mode: PermissionMode, options: &str) -> serde_json::Value {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("answer.json");
+        let client = startup_for(mode, fake_agent_script(false, options, &out))
+            .spawn_agent()
+            .await
+            .expect("spawn fake agent");
+        prompt_and_read_answer(client, &out).await
+    }
 
     #[tokio::test]
     async fn dont_ask_pool_agent_rejects_permission_requests() {
-        let answer = harness_answer(PermissionMode::DontAsk, ALLOW_AND_REJECT).await;
+        let answer = pool_agent_answer(PermissionMode::DontAsk, ALLOW_AND_REJECT).await;
         assert_eq!(answer["id"], "perm-1");
         assert_eq!(answer["result"]["outcome"]["outcome"], "selected");
         assert_eq!(answer["result"]["outcome"]["optionId"], "opt-reject");
@@ -209,14 +223,31 @@ sleep 1"#,
 
     #[tokio::test]
     async fn plan_pool_agent_cancels_when_only_allow_is_offered() {
-        let answer = harness_answer(PermissionMode::Plan, ALLOW_ONLY).await;
+        let answer = pool_agent_answer(PermissionMode::Plan, ALLOW_ONLY).await;
         assert_eq!(answer["id"], "perm-1");
         assert_eq!(answer["result"]["outcome"]["outcome"], "cancelled");
     }
 
     #[tokio::test]
     async fn bypass_pool_agent_still_auto_approves() {
-        let answer = harness_answer(PermissionMode::BypassPermissions, ALLOW_AND_REJECT).await;
+        let answer = pool_agent_answer(PermissionMode::BypassPermissions, ALLOW_AND_REJECT).await;
         assert_eq!(answer["result"]["outcome"]["optionId"], "opt-allow");
+    }
+
+    /// Refill, panic recovery and crash respawn all go through
+    /// `spawn_and_init`; a replacement agent must keep the reject policy.
+    #[tokio::test]
+    async fn respawned_dont_ask_agent_keeps_rejecting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("answer.json");
+        let startup = startup_for(
+            PermissionMode::DontAsk,
+            fake_agent_script(true, ALLOW_AND_REJECT, &out),
+        );
+        let (client, _, _) = crate::spawn_and_init(&startup, 0)
+            .await
+            .expect("respawn path spawns and initializes");
+        let answer = prompt_and_read_answer(client, &out).await;
+        assert_eq!(answer["result"]["outcome"]["optionId"], "opt-reject");
     }
 }
