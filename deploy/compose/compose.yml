@@ -1,7 +1,18 @@
 name: buzz-prod
 
+# Bounded json-file logs (disk headroom on the single-disk droplet). Docker applies log options only
+# when a container is created, so adding them to a service means recreating it. Applied to the relay
+# first; the stateful stores get it at their next planned recreate, once a production restore runbook exists.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+    compress: "true"
+
 services:
   relay:
+    logging: *default-logging
     image: ${BUZZ_IMAGE:-ghcr.io/block/buzz:main}
     env_file:
       - .env
