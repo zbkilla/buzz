@@ -126,6 +126,83 @@ fn advancement_requires_its_own_policy_flag() {
     );
 }
 
+/// The repaired layout once January 2027 arrives: the current month and the
+/// whole lookahead route to the empty catch-all, as on a fresh install.
+fn catch_all_serving_now_audit() -> PartitionTableAudit {
+    let mut audit = repaired_audit(false);
+    audit.months = (0..=PARTITION_MANAGER_MONTHS_AHEAD as i32)
+        .map(|offset| {
+            let (year, m) = add_months(2027, 1, offset).unwrap();
+            MonthCoverage {
+                start: month(year, m),
+                kind: MonthCoverageKind::CoveredByCatchAll,
+            }
+        })
+        .collect();
+    audit
+}
+
+fn with_catch_all(
+    mut audit: PartitionTableAudit,
+    edit: impl Fn(&mut PartitionChildAudit),
+) -> PartitionTableAudit {
+    for child in &mut audit.children {
+        if child.kind == PartitionChildKind::CatchAll {
+            edit(child);
+        }
+    }
+    audit
+}
+
+#[test]
+fn only_a_catch_all_serving_the_current_month_awaits_advance() {
+    let serving = catch_all_serving_now_audit();
+    assert!(serving.awaits_catch_all_advance(ADVANCE));
+
+    // The routine monthly advance: the planner would advance, but only the end
+    // of the window routes to the catch-all, so it waits for the next pass.
+    let routine = repaired_audit(false);
+    assert!(matches!(
+        plan_maintenance(&routine, ADVANCE),
+        MaintenancePlan::Apply(_)
+    ));
+    assert!(!routine.awaits_catch_all_advance(ADVANCE));
+
+    // Advancement disabled, including by the create kill switch.
+    for policy in [
+        CREATE_ONLY,
+        PartitionMaintenancePolicy {
+            create_enabled: false,
+            advance_enabled: true,
+        },
+        PartitionMaintenancePolicy::default(),
+    ] {
+        assert!(!serving.awaits_catch_all_advance(policy), "{policy:?}");
+    }
+
+    // Layouts the planner refuses need an operator, not prompt retries.
+    let occupied = with_catch_all(serving.clone(), |child| {
+        child.catch_all_nonempty = Some(true);
+    });
+    let child_triggers = with_catch_all(serving.clone(), |child| {
+        child.extra_triggers = vec!["child_only_probe".to_string()];
+    });
+    for refused in [&occupied, &child_triggers] {
+        assert!(matches!(
+            plan_maintenance(refused, ADVANCE),
+            MaintenancePlan::Refuse(_)
+        ));
+        assert!(!refused.awaits_catch_all_advance(ADVANCE));
+    }
+
+    let catalog = |tables| PartitionAudit {
+        audited_at: month(2027, 1),
+        tables,
+    };
+    assert!(catalog(vec![routine.clone(), serving]).awaits_catch_all_advance(ADVANCE));
+    assert!(!catalog(vec![routine, occupied]).awaits_catch_all_advance(ADVANCE));
+}
+
 #[test]
 fn full_monthly_runway_is_a_noop_even_when_disabled() {
     let mut audit = repaired_audit(false);
@@ -331,6 +408,7 @@ mod postgres_tests {
         catalog_snapshot, create_child, fixed_now, scratch_pool, scratch_pool_with_max_connections,
         seed_parents,
     };
+    use crate::test_support::ScratchDb;
 
     /// The repaired incident layout for both managed parents, optionally with
     /// outgoing foreign keys to a `communities` counterpart.
@@ -505,6 +583,184 @@ mod postgres_tests {
             .children
             .iter()
             .any(|child| child.name == format!("{}_p2026_09", table.table))));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn cluster_global_parent_readers_follow_monthly_creation_and_catch_all_advancement() {
+        use crate::store::partition::quote_identifier;
+
+        let (pool, scratch) = scratch_pool().await;
+        seed_parents(&pool).await;
+        let reader = format!("{}_r\"x", scratch.name);
+        let writer = format!("{}_writer", scratch.name);
+        for role in [&reader, &writer] {
+            execute_ddl(
+                &mut pool.acquire().await.unwrap(),
+                format!("CREATE ROLE {}", quote_identifier(role)),
+            )
+            .await
+            .unwrap();
+        }
+        for statement in [
+            format!(
+                "GRANT USAGE ON SCHEMA {} TO {}, {}",
+                scratch.name,
+                quote_identifier(&reader),
+                quote_identifier(&writer)
+            ),
+            format!(
+                "GRANT SELECT ON events TO {} WITH GRANT OPTION",
+                quote_identifier(&reader)
+            ),
+            format!(
+                "GRANT INSERT, UPDATE ON events TO {}",
+                quote_identifier(&reader)
+            ),
+            format!(
+                "GRANT INSERT, SELECT (id) ON events TO {}",
+                quote_identifier(&writer)
+            ),
+            "GRANT SELECT ON delivery_log TO PUBLIC".to_string(),
+            "CREATE TABLE unrelated (id BIGINT)".to_string(),
+        ] {
+            execute_ddl(&mut pool.acquire().await.unwrap(), statement)
+                .await
+                .unwrap();
+        }
+        for table in PARTITIONED_TABLES {
+            create_child(
+                &pool,
+                table,
+                &format!("{table}_p_past"),
+                "MINVALUE",
+                "'2026-09-01'",
+            )
+            .await;
+        }
+
+        maintain_partitions_at(&pool, 0, CREATE_ONLY, fixed_now())
+            .await
+            .expect("create uncovered September");
+        let can = |role: String, relation: String, privilege: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, bool>("SELECT has_table_privilege($1, $2, $3)")
+                    .bind(role)
+                    .bind(relation)
+                    .bind(privilege)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        let mut direct_read = pool.begin().await.unwrap();
+        execute_ddl(
+            &mut direct_read,
+            format!("SET LOCAL ROLE {}", quote_identifier(&reader)),
+        )
+        .await
+        .unwrap();
+        sqlx::query("SELECT * FROM events_p2026_09 LIMIT 0")
+            .execute(&mut *direct_read)
+            .await
+            .expect("parent reader can query the new child directly");
+        direct_read.rollback().await.unwrap();
+        assert!(can(reader.clone(), "events_p2026_09".into(), "SELECT").await);
+        for privilege in ["INSERT", "UPDATE", "SELECT WITH GRANT OPTION"] {
+            assert!(!can(reader.clone(), "events_p2026_09".into(), privilege).await);
+        }
+        for relation in [
+            "events_p2026_09",
+            "events_p_past",
+            "delivery_log_p_past",
+            "unrelated",
+        ] {
+            assert!(!can(writer.clone(), relation.into(), "SELECT").await);
+        }
+        assert!(!can(reader.clone(), "events_p_past".into(), "SELECT").await);
+        assert!(!can(reader.clone(), "unrelated".into(), "SELECT").await);
+        assert!(can(writer.clone(), "delivery_log_p2026_09".into(), "SELECT").await);
+
+        // The next rotation uses the current parent ACL, not a cached reader list.
+        for statement in [
+            format!("REVOKE SELECT ON events FROM {}", quote_identifier(&reader)),
+            format!("GRANT SELECT ON events TO {}", quote_identifier(&writer)),
+        ] {
+            execute_ddl(&mut pool.acquire().await.unwrap(), statement)
+                .await
+                .unwrap();
+        }
+        for table in PARTITIONED_TABLES {
+            create_child(
+                &pool,
+                table,
+                &format!("{table}_p_future"),
+                "'2026-10-01'",
+                "MAXVALUE",
+            )
+            .await;
+        }
+        maintain_partitions_at(&pool, 1, ADVANCE, fixed_now())
+            .await
+            .expect("replace catch-all and grant new readers");
+        for relation in ["events_p2026_10", "events_p_future"] {
+            assert!(can(writer.clone(), relation.into(), "SELECT").await);
+            assert!(!can(writer.clone(), relation.into(), "INSERT").await);
+            assert!(!can(reader.clone(), relation.into(), "SELECT").await);
+        }
+        for relation in ["delivery_log_p2026_10", "delivery_log_p_future"] {
+            assert!(can(reader.clone(), relation.into(), "SELECT").await);
+            assert!(!can(reader.clone(), relation.into(), "INSERT").await);
+        }
+        let before = catalog_snapshot(&pool).await;
+        maintain_partitions_at(&pool, 1, ADVANCE, fixed_now())
+            .await
+            .unwrap();
+        assert_eq!(catalog_snapshot(&pool).await, before);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn cluster_global_reader_grant_failure_rolls_back_partition_replacement() {
+        let (pool, scratch) = scratch_pool().await;
+        seed_repaired_layout(&pool, false).await;
+        sqlx::query("GRANT SELECT ON events TO PUBLIC")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = catalog_snapshot(&pool).await;
+        sqlx::query(
+            "CREATE FUNCTION reject_partition_grant() RETURNS event_trigger \
+             LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected grant failure'; END $$",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        execute_ddl(
+            &mut pool.acquire().await.unwrap(),
+            format!(
+                "CREATE EVENT TRIGGER {}_grant_failure ON ddl_command_start \
+                 WHEN TAG IN ('GRANT') EXECUTE FUNCTION reject_partition_grant()",
+                scratch.name
+            ),
+        )
+        .await
+        .unwrap();
+
+        let result = maintain(&pool).await;
+        assert!(
+            matches!(result, Err(DbError::InvalidData(ref message))
+                if message.contains("events error") && message.contains("injected grant failure")),
+            "{result:?}"
+        );
+        let events = |snapshot: Vec<(String, String, String, i64)>| {
+            snapshot
+                .into_iter()
+                .filter(|(name, ..)| name.starts_with("events_"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(events(catalog_snapshot(&pool).await), events(before));
     }
 
     #[tokio::test]
@@ -1305,5 +1561,73 @@ mod postgres_tests {
             .iter()
             .any(|(name, ..)| name == "events_p_future_next"));
         assert_ne!(after, before, "delivery_log still advances");
+    }
+
+    /// Audits taken in a freshly migrated database before and after its first passes.
+    struct FreshInstallPasses {
+        migrated: PartitionAudit,
+        create_only: PartitionAudit,
+        advanced: PartitionAudit,
+        repeated: PartitionAudit,
+    }
+
+    /// Runs every migration in a dedicated database, then the passes a relay
+    /// would run at `fixed_now()`. The database is dropped before returning.
+    async fn fresh_install_passes() -> Result<FreshInstallPasses> {
+        let database =
+            ScratchDb::create(&crate::test_support::database_url(), "buzz_partition_fresh").await;
+        let passes = async {
+            let pool = PgPool::connect(database.url()).await?;
+            let result = async {
+                crate::migration::run_migrations(&pool).await?;
+                let now = fixed_now();
+                Ok(FreshInstallPasses {
+                    migrated: audit_partition_catalog_at(
+                        &pool,
+                        PARTITION_MANAGER_MONTHS_AHEAD,
+                        now,
+                    )
+                    .await?,
+                    create_only: maintain_partitions_at(
+                        &pool,
+                        PARTITION_MANAGER_MONTHS_AHEAD,
+                        CREATE_ONLY,
+                        now,
+                    )
+                    .await?,
+                    advanced: maintain(&pool).await?,
+                    repeated: maintain(&pool).await?,
+                })
+            }
+            .await;
+            pool.close().await;
+            result
+        }
+        .await;
+        passes
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn fresh_install_catch_all_advances_on_the_first_pass() {
+        let passes = fresh_install_passes().await.expect("fresh-install passes");
+
+        // The migrations end every managed table in an empty catch-all that
+        // already serves months, and creation alone cannot replace it.
+        for audit in [&passes.migrated, &passes.create_only] {
+            assert_eq!(audit.tables.len(), PARTITIONED_TABLES.len());
+            assert!(audit.awaits_catch_all_advance(ADVANCE), "{audit:?}");
+            for table in &audit.tables {
+                assert!(table.awaits_catch_all_advance(ADVANCE), "{}", table.table);
+            }
+        }
+
+        assert_advanced(&passes.advanced);
+        assert!(!passes.advanced.awaits_catch_all_advance(ADVANCE));
+        assert!(passes.advanced.serving_safe());
+        for table in &passes.advanced.tables {
+            assert!(!table.degraded(), "{}: {table:?}", table.table);
+        }
+        assert_eq!(passes.repeated, passes.advanced);
     }
 }
