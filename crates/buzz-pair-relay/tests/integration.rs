@@ -438,7 +438,7 @@ async fn test_second_sub_same_id() {
     assert_eq!(ev_msg[1], "s1");
 }
 
-/// 9. Connection closes after 120 s (virtual time).
+/// 9. Connection closes after the 600 s fork lifetime (virtual time).
 #[tokio::test]
 async fn test_120s_timeout() {
     let url = start_relay().await;
@@ -447,7 +447,7 @@ async fn test_120s_timeout() {
     subscribe(&mut ws, "ready", P_A).await;
     tokio::time::pause();
     // Advance virtual time past the connection timeout.
-    tokio::time::advance(Duration::from_secs(121)).await;
+    tokio::time::advance(Duration::from_secs(601)).await;
     // Yield to let the relay task run its deadline branch.
     tokio::task::yield_now().await;
 
@@ -1180,7 +1180,7 @@ async fn test_reader_backpressure_closes() {
     }
 }
 
-/// 42. Connection closes promptly after 120 s (virtual time).
+/// 42. Connection closes promptly after the 600 s fork lifetime (virtual time).
 ///     Explicit duplicate of test 9 with a slightly different assertion style.
 #[tokio::test]
 async fn test_cancellation_immediate() {
@@ -1190,7 +1190,7 @@ async fn test_cancellation_immediate() {
     // Observe a relay response so the connection deadline is installed.
     subscribe(&mut ws, "ready", P_A).await;
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(121)).await;
+    tokio::time::advance(Duration::from_secs(601)).await;
     tokio::task::yield_now().await;
 
     // TCP closure is real I/O; do not auto-advance the assertion timeout
