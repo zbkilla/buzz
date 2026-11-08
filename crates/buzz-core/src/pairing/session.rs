@@ -704,14 +704,14 @@ impl PairingSession {
     fn has_processed(&self, event: &Event) -> bool {
         self.processed_ids.contains(&event.id.to_bytes())
     }
+}
 
+impl PairingSession {
     /// Override the default session timeout.
     pub fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
     }
-}
 
-impl PairingSession {
     /// Encrypt a message and wrap it in a signed kind:24134 event.
     ///
     /// # Secret handling
